@@ -3,6 +3,8 @@ package net.horizonsend.ion.server.features.starship.control.input
 //import net.horizonsend.ion.server.features.nations.NationBuffTypes
 import com.destroystokyo.paper.event.player.PlayerJumpEvent
 import net.horizonsend.ion.common.database.schema.misc.PlayerSettings
+import net.horizonsend.ion.common.extensions.information
+import net.horizonsend.ion.common.extensions.informationAction
 import net.horizonsend.ion.common.extensions.success
 import net.horizonsend.ion.common.utils.text.ofChildren
 import net.horizonsend.ion.server.command.admin.debug
@@ -14,6 +16,8 @@ import net.horizonsend.ion.server.features.starship.StarshipType
 import net.horizonsend.ion.server.features.starship.active.ActiveStarships
 import net.horizonsend.ion.server.features.starship.control.controllers.player.PlayerController
 import net.horizonsend.ion.server.features.starship.control.movement.DirectControlHandler
+import net.horizonsend.ion.server.features.starship.fleet.Fleets
+import net.horizonsend.ion.server.features.starship.fleet.toFleetMember
 import net.horizonsend.ion.server.features.starship.status_effects.StarshipStatusEffectTypes
 import net.horizonsend.ion.server.miscellaneous.utils.minecraft
 import net.kyori.adventure.text.Component.keybind
@@ -139,11 +143,18 @@ class PlayerDirectControlInput(override val controller: PlayerController) : Dire
 		if (input.isRight) strafe += 1.0
 		if (input.isForward) ascend += 1.0
 		if (input.isBackward) ascend -= 1.0
-		if(input.isJump) {
+		if(input.isSprint) {
 			if(player.server.currentTick-lastTertiaryInput > 10) {
-				handleTertiaryInput()
+				handleTertiaryInput(starship)
 				lastTertiaryInput = player.server.currentTick
 			}
+		}
+		if(input.isJump){
+			starship.informationAction("Drifting")
+			starship.reactor.powerDistributor.thrusterPortion = 0.1
+		}
+		else {
+			starship.reactor.powerDistributor.thrusterPortion = 0.5
 		}
 
 		// Convert to world-relative vector
@@ -229,6 +240,9 @@ class PlayerDirectControlInput(override val controller: PlayerController) : Dire
 
 				targetShip.let {
 					if (it == starship) return //should prevent setting to yourself
+					if (starship.isInterdicting) return //cant be having them disrupting and interdicting
+					//should stop you disrupting your own fleet members.
+					if (it?.playerPilot != null && Fleets.findByMember(player)?.contains(it.playerPilot!!) == true) return
 					starship.disruptorTarget = it
 					starship.onlinePassengers.forEach { player -> player.success("Disruptor enabled on ${it?.identifier ?: "unknown starship; their hyperdrive is disabled as long as your starship is in range"}") }
 				}

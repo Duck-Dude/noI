@@ -4,6 +4,8 @@ import com.google.common.collect.HashBiMap
 import com.google.common.collect.HashMultimap
 import it.unimi.dsi.fastutil.longs.LongOpenHashSet
 import net.horizonsend.ion.common.database.Oid
+import net.horizonsend.ion.common.database.cache.nations.RelationCache
+import net.horizonsend.ion.common.database.schema.nations.NationRelation
 import net.horizonsend.ion.common.database.schema.starships.StarshipData
 import net.horizonsend.ion.common.extensions.hint
 import net.horizonsend.ion.common.extensions.information
@@ -27,13 +29,13 @@ import net.horizonsend.ion.common.utils.text.template
 import net.horizonsend.ion.server.IonServer
 import net.horizonsend.ion.server.command.admin.debug
 import net.horizonsend.ion.server.configuration.ServerConfiguration
+import net.horizonsend.ion.server.features.cache.PlayerCache
 import net.horizonsend.ion.server.features.multiblock.manager.ShipMultiblockManager
 import net.horizonsend.ion.server.features.multiblock.type.starship.gravitywell.GravityWellMultiblock
 import net.horizonsend.ion.server.features.player.CombatTimer
 import net.horizonsend.ion.server.features.progression.ShipKillXP
 import net.horizonsend.ion.server.features.space.body.planet.CachedPlanet
 import net.horizonsend.ion.server.features.starship.PilotedStarships.isPiloted
-import net.horizonsend.ion.server.features.starship.active.ActiveControlledStarship
 import net.horizonsend.ion.server.features.starship.active.ActiveStarships
 import net.horizonsend.ion.server.features.starship.control.controllers.Controller
 import net.horizonsend.ion.server.features.starship.control.controllers.NoOpController
@@ -44,11 +46,15 @@ import net.horizonsend.ion.server.features.starship.control.controllers.player.U
 import net.horizonsend.ion.server.features.starship.control.input.AIDirectControlInput
 import net.horizonsend.ion.server.features.starship.control.input.AIShiftFlightInput
 import net.horizonsend.ion.server.features.starship.control.input.PlayerDirectControlInput
+import net.horizonsend.ion.server.features.starship.control.input.PlayerDirectCruiseControlInput
 import net.horizonsend.ion.server.features.starship.control.input.PlayerShiftFlightInput
+import net.horizonsend.ion.server.features.starship.control.movement.CruiseData
 import net.horizonsend.ion.server.features.starship.control.movement.DirectControlHandler
+import net.horizonsend.ion.server.features.starship.control.movement.DirectCruiseControlHandler
 import net.horizonsend.ion.server.features.starship.control.movement.ShiftFlightHandler
 import net.horizonsend.ion.server.features.starship.control.movement.StarshipControl
 import net.horizonsend.ion.server.features.starship.control.movement.StarshipCruising
+import net.horizonsend.ion.server.features.starship.control.signs.map.DisplayMap
 import net.horizonsend.ion.server.features.starship.damager.Damager
 import net.horizonsend.ion.server.features.starship.event.movement.StarshipMoveEvent
 import net.horizonsend.ion.server.features.starship.event.movement.StarshipRotateEvent
@@ -114,6 +120,7 @@ import net.kyori.adventure.text.format.NamedTextColor.WHITE
 import net.kyori.adventure.text.format.TextDecoration
 import net.starlegacy.feature.starship.active.ActiveStarshipHitbox
 import org.bukkit.Bukkit
+import org.bukkit.GameMode
 import org.bukkit.Location
 import org.bukkit.World
 import org.bukkit.block.BlockFace
@@ -124,8 +131,7 @@ import org.bukkit.entity.Player
 import org.bukkit.util.NumberConversions
 import org.bukkit.util.Vector
 import java.time.Duration
-import java.util.LinkedList
-import java.util.UUID
+import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
@@ -167,6 +173,9 @@ class Starship(
 	val carriedShips: MutableMap<StarshipData, LongOpenHashSet> = carriedShips.toMutableMap()
 	val statusEffects: MutableMap<StarshipStatusEffectType, MutableList<StarshipStatusEffect>> = mutableMapOf()
 
+	var cruiseTickCount = 0
+	var moveThisShipThisTick = false
+
 	var world: World = data.bukkitWorld()
 		set(value) {
 			ActiveStarships.updateWorld(this, field, value)
@@ -181,12 +190,19 @@ class Starship(
 		shiftKinematicEstimator.removeData()
 		cruiseKinematicEstimator.removeData()
 
+		cruiseTickCount+=1
+		if(cruiseTickCount.toDouble() == 20*StarshipCruising.SECONDS_PER_CRUISE){
+			cruiseTickCount = 0
+			moveThisShipThisTick = true
+		}
+
 		if (forecastEnabled) {
 			displayForecast(this)
 		}
 		if (statsEnabled) {
 			logStatistics(this)
 		}
+		displayMaps.forEach { it.tick() }
 	}
 
 	/** Called when a starship is removed. Any cleanup logic should be done here. */
@@ -371,10 +387,14 @@ class Starship(
 	//endregion
 
 	//region Movement
-	var cruiseData = StarshipCruising.CruiseData(this)
+	var cruiseData = CruiseData(this)
 	var lastBlockedTime: Long = 0
 	val manualMoveCooldownMillis: Long = (cbrt(initialBlockCount.toDouble()) * 40).toLong()
 	var speedLimit = -1
+
+	//direct cruise, cruise speedup (brings direct cruise in line with shift fly speed in certain situations).
+	var directCruiseSpeedAddition: Double = 0.0
+
 	// manual move is sneak/direct control
 	var lastManualMove = System.nanoTime() / 1_000_000
 
@@ -458,6 +478,10 @@ class Starship(
 		return controller.movementHandler is DirectControlHandler
 	}
 
+	val isDirectCruiseControlEnable: Boolean get(){
+		return controller.movementHandler is DirectCruiseControlHandler
+	}
+
 	var directControlCenter: Location? = null
 
 	// Stored on starship so it can't be reset by switching to dc and back
@@ -467,6 +491,12 @@ class Starship(
 	fun setDirectControlEnabled(enabled: Boolean) {
 		if (enabled && StarshipCruising.isCruising(this)) {
 			this.userErrorAction("Direct Control cannot be enabled while cruising")
+			return
+		}
+		if (this.initialBlockCount > 12501){
+			this.userErrorAction(
+				"Only ships of size 12500 or less can use direct control"
+			)
 			return
 		}
 		when (controller) {
@@ -479,6 +509,22 @@ class Starship(
 				val controller = controller as AIController
 				if (enabled) controller.movementHandler = DirectControlHandler(controller, AIDirectControlInput(controller)) else
 					controller.movementHandler = ShiftFlightHandler(controller, AIShiftFlightInput(controller))
+			}
+			else -> return
+		}
+	}
+
+	fun setDirectCruiseControlEnabled(enabled: Boolean){
+		if (enabled && this.isDirectControlEnabled) {
+			this.userErrorAction("Direct Cruise Control cannot be enabled while Direct Control is activated")
+			return
+		}
+		when (controller) {
+			is ActivePlayerController -> {
+				val controller = controller as ActivePlayerController
+				if (enabled) controller.movementHandler =
+					DirectCruiseControlHandler(controller, PlayerDirectCruiseControlInput(controller)) else
+					controller.movementHandler = ShiftFlightHandler(controller, PlayerShiftFlightInput(controller))
 			}
 			else -> return
 		}
@@ -507,6 +553,7 @@ class Starship(
 	val fuelTanks = LinkedList<FuelTankSubsystem>()
 	val customTurrets = LinkedList<CustomTurretSubsystem>()
 	val commandBursts = LinkedList<AbstractCommandBurstSubsystem<*>>()
+	val displayMaps = LinkedList<DisplayMap>()
 
 	val shieldBars = mutableMapOf<String, BossBar>()
 
@@ -579,7 +626,7 @@ class Starship(
 		}
 
 		disruptorTarget = otherStarship
-		onlinePassengers.forEach { player -> player.success("Disruptor enabled on ${disruptorTarget?.identifier ?: "unknown starship; their hyperdrive is disabled as long as your starship is in range"}") }
+		onlinePassengers.forEach { player -> player.success("Disruptor enabled on target Starship!") }
 	}
 
 	fun enableJumpBeacon() {
@@ -717,6 +764,7 @@ class Starship(
 	//region Passengers
 	private val passengers = HashSet<UUID>()
 	val passengerIDs get() = passengers.toList()
+	val entityPassengers = HashSet<Entity>()
 	val onlinePassengers get() = passengers.mapNotNull(Bukkit::getPlayer)
 
 	fun isPassenger(playerID: UUID): Boolean {
@@ -925,5 +973,23 @@ class Starship(
 		}
 
 		return false
+	}
+
+	fun getContacts() : List<Starship> {
+		return ActiveStarships.all().filter {
+			it.world == this.world
+				&& it.centerOfMass.toVector().distanceSquared(this.centerOfMass.toVector()) <= 2500.squared().coerceIn(0,it.balancing.contactsRange.squared())
+				&& it.controller !== this.controller
+				&& (it.controller as? PlayerController)?.player?.gameMode != GameMode.SPECTATOR
+		}
+	}
+
+	fun getRelation(other: Starship): NationRelation.Level{
+			val viewerNation = PlayerCache.getIfOnline(this.playerPilot ?: return NationRelation.Level.NONE)?.nationOid
+				?: return NationRelation.Level.NONE
+			val otherNation = PlayerCache.getIfOnline(other.playerPilot ?: return NationRelation.Level.NONE)?.nationOid
+				?: return NationRelation.Level.NONE
+			this.controller.getColor()
+			return RelationCache[viewerNation, otherNation]
 	}
 }
