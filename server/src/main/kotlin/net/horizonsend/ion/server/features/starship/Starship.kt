@@ -12,6 +12,7 @@ import net.horizonsend.ion.common.extensions.information
 import net.horizonsend.ion.common.extensions.informationAction
 import net.horizonsend.ion.common.extensions.serverError
 import net.horizonsend.ion.common.extensions.success
+import net.horizonsend.ion.common.extensions.userError
 import net.horizonsend.ion.common.extensions.userErrorAction
 import net.horizonsend.ion.common.utils.miscellaneous.d
 import net.horizonsend.ion.common.utils.miscellaneous.squared
@@ -54,7 +55,7 @@ import net.horizonsend.ion.server.features.starship.control.movement.DirectCruis
 import net.horizonsend.ion.server.features.starship.control.movement.ShiftFlightHandler
 import net.horizonsend.ion.server.features.starship.control.movement.StarshipControl
 import net.horizonsend.ion.server.features.starship.control.movement.StarshipCruising
-import net.horizonsend.ion.server.features.starship.control.signs.map.DisplayMap
+import net.horizonsend.ion.server.features.starship.control.signs.display.Display
 import net.horizonsend.ion.server.features.starship.damager.Damager
 import net.horizonsend.ion.server.features.starship.event.movement.StarshipMoveEvent
 import net.horizonsend.ion.server.features.starship.event.movement.StarshipRotateEvent
@@ -202,7 +203,7 @@ class Starship(
 		if (statsEnabled) {
 			logStatistics(this)
 		}
-		displayMaps.forEach { it.tick() }
+		displays.forEach { it.tick() }
 	}
 
 	/** Called when a starship is removed. Any cleanup logic should be done here. */
@@ -485,8 +486,11 @@ class Starship(
 	var directControlCenter: Location? = null
 
 	// Stored on starship so it can't be reset by switching to dc and back
-	val initialDirectControlCooldown get() = 300L + ((initialBlockCount / 700)/*.coerceAtLeast(1)*/) * 30
+	val initialDirectControlCooldown get() = 300L + ((initialBlockCount / 700)/*.coerceAtLeast(1)*/) * 60
 	var directControlCooldown = initialDirectControlCooldown
+	//new cooldown formula divided by old cooldown formula gives us a corrective factor dependent on block-count & slot speed.
+	//This yields us the factor to multiply by to yield the same speed.
+	fun correctiveFactorForDirectControlSpeed(slot: Double) = (300.0 + 60.0*(initialBlockCount/700)-8.0*slot)/((300.0 + 30.0*(initialBlockCount/700)-8.0*slot))
 
 	fun setDirectControlEnabled(enabled: Boolean) {
 		if (enabled && StarshipCruising.isCruising(this)) {
@@ -553,7 +557,7 @@ class Starship(
 	val fuelTanks = LinkedList<FuelTankSubsystem>()
 	val customTurrets = LinkedList<CustomTurretSubsystem>()
 	val commandBursts = LinkedList<AbstractCommandBurstSubsystem<*>>()
-	val displayMaps = LinkedList<DisplayMap>()
+	val displays = LinkedList<Display>()
 
 	val shieldBars = mutableMapOf<String, BossBar>()
 
@@ -617,6 +621,21 @@ class Starship(
 
 	fun setIsDisrupting(otherStarship: Starship?) {
 		Tasks.checkMainThread()
+
+		if (otherStarship == this) {
+			userError("Cannot disrupt your own ship!")
+			return
+		}
+		//if (starship.disruptorTarget == targetStarship) fail { "Already disrupting that target!" }
+		if (this.isInterdicting) {
+			userError("Cannot interdict and disrupt at the same time!")
+			return
+		}
+
+		if (Interdiction.findDisruptor(this) == null){
+			userError("Intact Disruptor not found!")
+			return
+		}
 
 		if (otherStarship == null) {
 			disruptorTarget = null

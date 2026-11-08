@@ -91,6 +91,8 @@ class ShipFactoryPrintTask(
 	/** Counts of missing materials */
 	private val missingMaterials = mutableMapOf<PrintItem, AtomicInteger>()
 
+	private val referencesMarkedForRemoval = mutableMapOf<ItemReference, AtomicInteger>()
+
 	/** Total number of blocks that were skipped due to obstruction */
 	private var skippedBlocks = 0
 	/** Total number of blocks that placed successfully */
@@ -261,6 +263,14 @@ class ShipFactoryPrintTask(
 		val consumptionFailures = integration.flatMapTo(mutableSetOf()) { it.commitTransaction(this) }
 
 		Tasks.sync {
+			val iterator = referencesMarkedForRemoval.iterator()
+			while (iterator.hasNext()) {
+				val reference = iterator.next()
+				reference.key.inventory.getItem(reference.key.index)?.subtract(reference.value.get())
+
+				iterator.remove()
+			}
+
 			printBlocks(toPrint.minus(consumptionFailures), tickCredits)
 		}
 
@@ -486,19 +496,29 @@ class ShipFactoryPrintTask(
 			return items
 		}
 
-		/**
-		 * consumeItemFromReferences causes exceptions if it is run async due to setItem().
-		 *
-		 * I believe it occurs if a hopper block is a reference. The exception indicates that a BlockPhysicsUpdate
-		 * was caused, which must be called synchronously. The particular exception that I am looking at calls
-		 * the RandomizeableContainerBlockEntity version of setItem. Is there a way for setItem to ignore
-		 * block updates?
-		 *
-		 * Update: It's due to comparators that are adjacent to networked chests. The comparator triggers the
-		 * block update
-		 *
-		 * I'm just going to set this sync for now until a better solution can be found.
-		 */
+		private fun markItemsForConsumptionFromReferences(
+			references: Collection<ItemReference>,
+			amount: Int,
+			markedForRemoval: MutableMap<ItemReference, AtomicInteger>
+		): Int {
+			var remaining = amount
+
+			for (reference in references) {
+				if (remaining == 0) continue
+
+				if (markedForRemoval[reference] != null) continue // inventory slot was already marked; skip
+
+				val item = reference.get() ?: continue
+				val stackAmount = item.amount
+				val toRemove = minOf(stackAmount, remaining)
+
+				markedForRemoval[reference] = AtomicInteger(toRemove)
+				remaining -= toRemove
+			}
+
+			return remaining
+		}
+
 		fun consumeItemFromReferences(references: Collection<ItemReference>, amount: Int): Int {
 			var remaining = amount
 
@@ -520,6 +540,19 @@ class ShipFactoryPrintTask(
 		}
 	}
 
+	/**
+	 * Checks whether the required items to place a block are available across provided inventories or integrations.
+	 *
+	 * If available, marks the necessary items for consumption and updates remaining counts.
+	 * If partially or fully unavailable, attempts to fulfill remaining requirements via integrations
+	 * or records the missing amount in [missingMaterials].
+	 *
+	 * @param printPosition The coordinate where the block will be placed.
+	 * @param availableItems Aggregated map of items available in accessible inventories.
+	 * @param printItem The item representation corresponding to the block.
+	 * @param requiredAmount The quantity of the item needed for printing.
+	 * @return `true` if all required materials could be sourced and staged for consumption, `false` otherwise.
+	 */
 	private fun checkAvailableItems(
 		printPosition: BlockKey,
 		availableItems: Map<PrintItem, AvailableItemInformation>,
@@ -534,19 +567,23 @@ class ShipFactoryPrintTask(
 				return false
 			}
 
+		// When inventories hold less than the required amount, attempt partial fulfillment via integration
 		if (resourceInformation.amount.get() < requiredAmount) {
-			// the missing amount was being calculated incorrectly, resulting in duped items
 			val availableFromInventories = resourceInformation.amount.get()
 			val missing = requiredAmount - availableFromInventories
 
-			// Try and make a partial purchase with the missing amount
+			// Try to handle the deficit through integration transactions
 			if (!integration.any { it.canAddTransaction(printItem, printPosition, missing) }) {
 				markItemMissing(printItem, missing)
 				return false
 			} else {
 				resourceInformation.amount.addAndGet(-availableFromInventories)
 
-				val missingFromInventories = consumeItemFromReferences(resourceInformation.references, availableFromInventories)
+				val missingFromInventories = markItemsForConsumptionFromReferences(
+					resourceInformation.references,
+					availableFromInventories,
+					referencesMarkedForRemoval
+				)
 
 				if (missingFromInventories == 0) return true
 
@@ -555,8 +592,10 @@ class ShipFactoryPrintTask(
 			}
 		}
 
+		// Deduct the full amount from available stock
 		resourceInformation.amount.addAndGet(-requiredAmount)
 
+		// Reduce previously tracked missing count if materials have become available
 		if (missingMaterials.containsKey(printItem)) {
 			val atomic = missingMaterials[printItem]
 
@@ -565,9 +604,11 @@ class ShipFactoryPrintTask(
 			}
 		}
 
+		// Mark individual inventory references for item consumption
 		val references = resourceInformation.references
-		val missing = consumeItemFromReferences(references, requiredAmount)
+		val missing = markItemsForConsumptionFromReferences(references, requiredAmount, referencesMarkedForRemoval)
 
+		// If some items could not be marked from inventory references, attempt integration fallback
 		if (missing > 0) {
 			resourceInformation.amount.addAndGet(missing)
 
